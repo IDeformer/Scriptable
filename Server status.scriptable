@@ -1,12 +1,80 @@
-{
-  "always_run_in_app" : false,
-  "icon" : {
-    "color" : "teal",
-    "glyph" : "magic"
-  },
-  "name" : "Server status",
-  "script" : "const initialData = {\n\tservers: [\n\t\t{\n\t\t\turl: 'http:\/\/192.168.0.1:5154',\n\t\t\ttitle: 'Server 1',\n\t\t\tonline: null,\n\t\t},\n\t\t{\n\t\t\turl: 'http:\/\/127.0.0.1:5154',\n\t\t\ttitle: 'Server 2',\n\t\t\tonline: null,\n\t\t},\n\t\t{\n\t\t\turl: 'https:\/\/3.example.com\/',\n\t\t\ttitle: 'Server 3',\n\t\t\tonline: null,\n\t\t},\n\t],\n\tlastUpdate: null\n}\n\n\/\/ Refresh Interval in seconds\nconst refreshInterval = 300\n\nconst widget = await createWidget()\n\nif (!config.runsInWidget) {\n\tawait widget.presentSmall()\n}\n\nScript.setWidget(widget)\nScript.complete()\n\nasync function createWidget(items) {\n\tconst data = await refresh()\n\tconst list = new ListWidget()\n\t\n\/\/\tuncomment the lines below if you want to show the header (not working with more than ~5 servers)\n\t\n\/\/ \tconst header = list.addText(\"Server Status\")\n\/\/ \theader.font = Font.mediumSystemFont(13)\n\/\/ \tlist.addSpacer()\n\n\tdata.servers.forEach((server) => {\n\t\tconst label = list.addText((server.online ? '🟢' : (server.online === false ? '🔴' : '❔')) + ' ' + server.title)\n\t\tlabel.font = Font.boldSystemFont(12)\n\t\tlabel.textColor = Color.gray()\n\t\tlist.refreshAfterDate = new Date(Date.now() + refreshInterval)\n\t\tlist.addSpacer(3)\n\t})\n\n\tif (data.lastUpdate) {\n\t\tlist.addSpacer()\n\t\tconst lastRefreshLabel = list.addText('Last refresh: ' + data.lastUpdate)\n\t\tlastRefreshLabel.font = Font.mediumSystemFont(8)\n\t}\n\n\treturn list\n}\n\nasync function refresh() {\n\tlet data = initialData\n\n\tfor (let server of data.servers) {\n\t\ttry {\n\t\t\tlet response = await new Request(server.url).loadString()\n\t\t\tserver.online = response && response.length > 0\n\t\t} catch (e) {\n\t\t\tserver.online = false\n\t\t}\n\t}\n\n\tlet now = new Date()\n\t\n\tlet hours = now.getHours()\n\tlet mins = now.getMinutes()\n\n\tdata.lastUpdate = (hours > 9 ? hours : '0' + hours) + ':' + (mins > 9 ? mins : '0' + mins)\n\treturn data\n}",
-  "share_sheet_inputs" : [
+const initialData = {
+	servers: [
+		{
+			url: 'http://192.168.0.2:5154',
+			title: 'Server 1',
+			online: null,
+		},
+		{
+			url: 'http://deformer.myddns.me:5154',
+			title: 'Server 2',
+			online: null,
+		},
+		{
+			url: 'https://3.example.com/',
+			title: 'Server 3',
+			online: null,
+		},
+	],
+	lastUpdate: null
+}
 
-  ]
+// Refresh Interval in seconds
+const refreshInterval = 300
+
+const widget = await createWidget()
+
+if (!config.runsInWidget) {
+	await widget.presentSmall()
+}
+
+Script.setWidget(widget)
+Script.complete()
+
+async function createWidget(items) {
+	const data = await refresh()
+	const list = new ListWidget()
+	
+//	uncomment the lines below if you want to show the header (not working with more than ~5 servers)
+	
+// 	const header = list.addText("Server Status")
+// 	header.font = Font.mediumSystemFont(13)
+// 	list.addSpacer()
+
+	data.servers.forEach((server) => {
+		const label = list.addText((server.online ? '🟢' : (server.online === false ? '🔴' : '❔')) + ' ' + server.title)
+		label.font = Font.boldSystemFont(12)
+		label.textColor = Color.gray()
+		list.refreshAfterDate = new Date(Date.now() + refreshInterval)
+		list.addSpacer(3)
+	})
+
+	if (data.lastUpdate) {
+		list.addSpacer()
+		const lastRefreshLabel = list.addText('Last refresh: ' + data.lastUpdate)
+		lastRefreshLabel.font = Font.mediumSystemFont(8)
+	}
+
+	return list
+}
+
+async function refresh() {
+	let data = initialData
+
+	for (let server of data.servers) {
+		try {
+			let response = await new Request(server.url).loadString()
+			server.online = response && response.length > 0
+		} catch (e) {
+			server.online = false
+		}
+	}
+
+	let now = new Date()
+	
+	let hours = now.getHours()
+	let mins = now.getMinutes()
+
+	data.lastUpdate = (hours > 9 ? hours : '0' + hours) + ':' + (mins > 9 ? mins : '0' + mins)
+	return data
 }
