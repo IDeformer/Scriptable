@@ -42,23 +42,14 @@ Scriptable — бесплатное приложение, позволяющее
 <details>
 <summary><b>Crypto Price Pro</b> — нажми, чтобы посмотреть</summary>
 <br>
-
 <img src="screenshots/crypto.jpg" width="350">
 <img src="screenshots/crypto_settings.jpg" width="350">
-
 </details>
 
 <details>
 <summary><b>Steam Wishlist</b> — нажми, чтобы посмотреть</summary>
 <br>
-
-<img src="screenshots/steam_1.jpg" width="450">
-<br><br>
-<img src="screenshots/steam_2.jpg" width="450">
-<br><br>
-<img src="screenshots/steam_3.jpg" width="450">
-
+<img src="screenshots/steam_1.jpg" width="350">
+<img src="screenshots/steam_2.jpg" width="350">
+<img src="screenshots/steam_3.jpg" width="350">
 </details>
-
-Готово!  
-Залей этот текст в README.md — всё сразу будет красиво, компактно и с раскрывающимися галереями.
