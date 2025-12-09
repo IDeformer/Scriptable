@@ -1,12 +1,873 @@
-{
-  "always_run_in_app" : false,
-  "icon" : {
-    "color" : "pink",
-    "glyph" : "magic"
-  },
-  "name" : "Crypto Price",
-  "script" : "\/\/ =====================\n\/\/ Crypto Widget Pro — единый стиль колонок\n\/\/ =====================\n\n\/\/ === Конфиг\nconst CONFIG = {\n  cacheMinutes: 15,\n  timeout: 10,\n  maxRetries: 3,\n\n  icons: { coin: 18, portfolio: 18 },\n\n  fonts: {\n    main: { symbol: 8, price: 8, change: 6 },\n    portfolio: { symbol: 8, value: 8, percent: 6 }\n  },\n\n  colors: {\n    text: new Color(\"#ffffff\"),\n    subtext: new Color(\"#aaaaaa\"),\n    portfolio: new Color(\"#aaaaaa\"),\n    up: new Color(\"#00ff88\"),\n    down: new Color(\"#ff5555\")\n  }\n};\n\n\/\/ === Справочник монет (дефолтный набор)\nlet coins = [\n  { id: \"bitcoin\",           symbol: \"BTC\",  icon: \"https:\/\/s2.coinmarketcap.com\/static\/img\/coins\/64x64\/1.png\" },\n  { id: \"the-open-network\",  symbol: \"TON\",  icon: \"https:\/\/assets.coingecko.com\/coins\/images\/17980\/large\/ton_symbol.png\" },\n  { id: \"near\",              symbol: \"NEAR\", icon: \"https:\/\/s2.coinmarketcap.com\/static\/img\/coins\/64x64\/6535.png\" },\n  { id: \"solana\",            symbol: \"SOL\",  icon: \"https:\/\/s2.coinmarketcap.com\/static\/img\/coins\/64x64\/5426.png\" },\n  { id: \"ethereum\",          symbol: \"ETH\",  icon: \"https:\/\/s2.coinmarketcap.com\/static\/img\/coins\/64x64\/1027.png\" },\n  { id: \"cardano\",           symbol: \"ADA\",  icon: \"https:\/\/s2.coinmarketcap.com\/static\/img\/coins\/64x64\/2010.png\" }\n];\n\n\/\/ Быстрый доступ coinId → объект монеты\nconst COINS_BY_ID = new Map(coins.map(c => [c.id, c]));\n\n\/\/ === ФС\/пути\nconst fm = FileManager.local();\nconst basePath = fm.documentsDirectory();\nconst paths = {\n  icons:     fm.joinPath(basePath, \"crypto_icons\"),\n  cache:     fm.joinPath(basePath, \"crypto_cache.json\"),     \/\/ кэш цен (с ключом ids)\n  search:    fm.joinPath(basePath, \"search_cache.json\"),     \/\/ кэш поиска\n  settings:  fm.joinPath(basePath, \"crypto_settings.json\"),\n  portfolio: fm.joinPath(basePath, \"crypto_portfolio.json\"),\n  alerts:    fm.joinPath(basePath, \"crypto_alerts.json\")\n};\nif (!fm.fileExists(paths.icons)) fm.createDirectory(paths.icons);\n\n\/\/ === Настройки по умолчанию\nconst DEFAULT_SETTINGS = {\n  selectedCoins: coins.slice(0, 3),\n  extraCoins: coins.slice(3, 6),\n  rightMode: 'extra', \/\/ 'extra' | 'portfolio'\n  showChange: true,\n  notifications: { enabled: true, priceChange: 10, portfolioChange: 5 }\n};\n\n\/\/ =====================\n\/\/ Утилиты\n\/\/ =====================\n\n\/\/ Настройки\nfunction loadSettings() {\n  if (fm.fileExists(paths.settings)) {\n    try {\n      const settings = JSON.parse(fm.readString(paths.settings));\n      return { ...DEFAULT_SETTINGS, ...settings };\n    } catch (e) {\n      console.log(`⚠️ Ошибка загрузки настроек: ${e.message}`);\n    }\n  }\n  return { ...DEFAULT_SETTINGS };\n}\nfunction saveSettings(settings) {\n  try { fm.writeString(paths.settings, JSON.stringify(settings)); }\n  catch (e) { console.log(`⚠️ Ошибка сохранения настроек: ${e.message}`); }\n}\n\n\/\/ Диалог\nasync function showAlert(title, message) {\n  const alert = new Alert();\n  alert.title = title;\n  alert.message = message;\n  alert.addAction(\"OK\");\n  await alert.presentAlert();\n}\n\n\/\/ Повторы с бэкоффом\nclass NetworkError extends Error {\n  constructor(message, retryable = true) { super(message); this.retryable = retryable; }\n}\nasync function retryAsync(fn, maxRetries = CONFIG.maxRetries) {\n  for (let i = 0; i < maxRetries; i++) {\n    try { return await fn(); }\n    catch (error) {\n      console.log(`↻ Попытка ${i + 1}\/${maxRetries} неудачна: ${error.message}`);\n      if (i === maxRetries - 1 || !error.retryable) throw error;\n      await new Promise(resolve => Timer.schedule(1000 * (i + 1), false, resolve));\n    }\n  }\n}\n\n\/\/ Общий кэш (для мелких словарей)\nclass Cache {\n  static isExpired(timestamp, minutes) {\n    return (Date.now() - timestamp) \/ 60000 > minutes;\n  }\n  static read(path) {\n    if (!fm.fileExists(path)) return null;\n    try {\n      const raw = JSON.parse(fm.readString(path));\n      return this.isExpired(raw.timestamp, CONFIG.cacheMinutes) ? null : raw.data;\n    } catch (e) {\n      console.log(`⚠️ Ошибка чтения кэша: ${e.message}`);\n      return null;\n    }\n  }\n  static write(path, data) {\n    try { fm.writeString(path, JSON.stringify({ data, timestamp: Date.now() })); }\n    catch (e) { console.log(`⚠️ Ошибка записи кэша: ${e.message}`); }\n  }\n}\n\n\/\/ Локальный кэш цен с проверкой набора ids (чтобы кэш подходил к запросу)\nfunction readPricesCache(expectedIdsCSV) {\n  if (!fm.fileExists(paths.cache)) return null;\n  try {\n    const raw = JSON.parse(fm.readString(paths.cache));\n    if (Cache.isExpired(raw.timestamp, CONFIG.cacheMinutes)) return null;\n    if (raw.ids !== expectedIdsCSV) return null;\n    return raw.data || null;\n  } catch (e) {\n    console.log(`⚠️ Ошибка чтения кэша цен: ${e.message}`);\n    return null;\n  }\n}\nfunction writePricesCache(idsCSV, data) {\n  try {\n    fm.writeString(paths.cache, JSON.stringify({ data, timestamp: Date.now(), ids: idsCSV }));\n  } catch (e) {\n    console.log(`⚠️ Ошибка записи кэша цен: ${e.message}`);\n  }\n}\n\n\/\/ =====================\n\/\/ API\n\/\/ =====================\n\n\/\/ Иконка\nasync function getIcon(coin) {\n  const file = fm.joinPath(paths.icons, `${coin.symbol}.png`);\n  if (fm.fileExists(file)) {\n    try { const img = Image.fromFile(file); if (img) return img; } catch { fm.remove(file); }\n  }\n  return await retryAsync(async () => {\n    const req = new Request(coin.icon);\n    req.timeoutInterval = CONFIG.timeout;\n    const img = await req.loadImage();\n    if (!img) throw new NetworkError(\"Иконка не загружена\");\n    try { fm.writeImage(file, img); } catch (e) { console.log(`⚠️ Не сохранил иконку ${coin.symbol}: ${e.message}`); }\n    return img;\n  });\n}\n\n\/\/ Поиск монеты по символу\nasync function searchCoin(symbol) {\n  const cached = Cache.read(paths.search);\n  if (cached && cached[symbol]) return cached[symbol];\n\n  try {\n    const url = `https:\/\/api.coingecko.com\/api\/v3\/search?query=${encodeURIComponent(symbol)}`;\n    const req = new Request(url);\n    req.timeoutInterval = CONFIG.timeout;\n    const data = await req.loadJSON();\n\n    if (!data?.coins?.length) throw new NetworkError(\"Токен не найден\");\n\n    const results = data.coins.slice(0, 5).map(coin => ({\n      id: coin.id,\n      symbol: coin.symbol.toUpperCase(),\n      name: coin.name,\n      icon: coin.large || coin.thumb || coins[0].icon\n    }));\n\n    const newCache = { ...(cached || {}), [symbol]: results };   \/\/ ← безопасное слияние\n    Cache.write(paths.search, newCache);\n    return results;\n  } catch (e) {\n    console.log(`⚠️ Ошибка поиска токена ${symbol}: ${e.message}`);\n    return null;\n  }\n}\n\n\/\/ Цены для набора монет (с кэшем по ids)\nasync function fetchPrices(coinList = coins) {\n  const ids = coinList.map(c => c.id).join(\",\");\n  const cached = readPricesCache(ids);\n  if (cached) return cached;\n\n  return await retryAsync(async () => {\n    const url = `https:\/\/api.coingecko.com\/api\/v3\/simple\/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;\n    const req = new Request(url);\n    req.timeoutInterval = CONFIG.timeout;\n    const data = await req.loadJSON();\n    if (!data || Object.keys(data).length === 0) throw new NetworkError(\"Пустой ответ от API\");\n    writePricesCache(ids, data);\n    return data;\n  });\n}\n\n\/\/ =====================\n\/\/ Форматирование\n\/\/ =====================\nfunction formatPrice(price) {\n  if (!price || price === 0) return \"—\";\n  if (price >= 1_000_000) return `${(price \/ 1_000_000).toFixed(1)}M$`;\n  if (price >= 1_000)     return `${(price \/ 1_000).toFixed(1)}K$`;\n  if (price >= 1)         return `${price.toFixed(2)}$`;\n  if (price >= 0.01)      return `${price.toFixed(4)}$`;\n  return `${price.toFixed(6).replace(\/0+$\/, \"\").replace(\/\\.$\/, \"\")}$`;\n}\nfunction formatCurrency(value) {\n  if (value >= 1_000_000) return `${(value \/ 1_000_000).toFixed(1)}M$`;\n  if (value >= 1_000)     return `${(value \/ 1_000).toFixed(1)}K$`;\n  return `${value.toFixed(2)}$`;\n}\n\n\/\/ =====================\n\/\/ Портфолио\n\/\/ =====================\nclass Portfolio {\n  static load() {\n    if (fm.fileExists(paths.portfolio)) {\n      try { return JSON.parse(fm.readString(paths.portfolio)); }\n      catch (e) { console.log(`⚠️ Ошибка загрузки портфолио: ${e.message}`); }\n    }\n    return {};\n  }\n  static save(portfolio) {\n    try { fm.writeString(paths.portfolio, JSON.stringify(portfolio)); }\n    catch (e) { console.log(`⚠️ Ошибка сохранения портфолио: ${e.message}`); }\n  }\n  static add(coinId, amount) {\n    const p = this.load();\n    p[coinId] = (p[coinId] || 0) + parseFloat(amount);\n    this.save(p);\n  }\n  static remove(coinId) {\n    const p = this.load();\n    delete p[coinId];\n    this.save(p);\n  }\n  static getValue(prices) {\n    const portfolio = this.load();\n    let totalValue = 0;\n    const breakdown = [];\n\n    for (const [coinId, amount] of Object.entries(portfolio)) {\n      const info = prices[coinId];\n      if (!info) continue;\n      const price = info.usd || 0;\n      const change = info.usd_24h_change || 0;\n      const value = amount * price;\n      totalValue += value;\n\n      const coin = COINS_BY_ID.get(coinId) || coins.find(c => c.id === coinId);\n      if (coin && value > 0) {\n        breakdown.push({\n          symbol: coin.symbol,\n          amount,\n          value,\n          change,\n          percentage: 0,\n          coin\n        });\n      }\n    }\n\n    breakdown.forEach(item => {\n      item.percentage = totalValue > 0 ? (item.value \/ totalValue) * 100 : 0;\n    });\n\n    return { totalValue, breakdown };\n  }\n}\n\n\/\/ =====================\n\/\/ Уведомления\n\/\/ =====================\nclass NotificationManager {\n  static load() {\n    if (fm.fileExists(paths.alerts)) {\n      try { return JSON.parse(fm.readString(paths.alerts)); } catch {}\n    }\n    return { lastPrices: {}, lastPortfolioValue: 0, lastCheck: 0 };\n  }\n  static save(data) { fm.writeString(paths.alerts, JSON.stringify(data)); }\n\n  static async checkAndNotify(prices, settings) {\n    if (!settings.notifications.enabled) return;\n\n    const state = this.load();\n    const now = Date.now();\n    if (now - state.lastCheck < 3600000) return; \/\/ не чаще часа\n\n    const notifications = [];\n    const allCoins = [...(settings.selectedCoins || []), ...(settings.extraCoins || [])];\n\n    \/\/ Изменения цен\n    for (const coin of allCoins) {\n      const current = prices[coin.id]?.usd;\n      const prev = state.lastPrices[coin.id];\n      if (current && prev) {\n        const change = ((current - prev) \/ prev) * 100;\n        if (Math.abs(change) >= settings.notifications.priceChange) {\n          notifications.push({\n            title: `${coin.symbol} ${change > 0 ? '📈' : '📉'}`,\n            body: `Изменение на ${change.toFixed(1)}%: ${formatCurrency(current)}`\n          });\n        }\n      }\n      if (current) state.lastPrices[coin.id] = current;\n    }\n\n    \/\/ Изменение стоимости портфеля (только если выбран режим портфеля справа)\n    if (settings.rightMode === 'portfolio') {\n      const { totalValue } = Portfolio.getValue(prices);\n      if (state.lastPortfolioValue > 0 && totalValue > 0) {\n        const change = ((totalValue - state.lastPortfolioValue) \/ state.lastPortfolioValue) * 100;\n        if (Math.abs(change) >= settings.notifications.portfolioChange) {\n          notifications.push({\n            title: `Портфолио ${change > 0 ? '💰' : '📉'}`,\n            body: `Изменение на ${change.toFixed(1)}%: ${formatCurrency(totalValue)}`\n          });\n        }\n      }\n      state.lastPortfolioValue = totalValue;\n    }\n\n    \/\/ Отправка\n    notifications.forEach(n => {\n      const notif = new Notification();\n      notif.title = n.title;\n      notif.body = n.body;\n      notif.schedule();\n    });\n\n    state.lastCheck = now;\n    this.save(state);\n  }\n}\n\n\/\/ =====================\n\/\/ Рендер строки (универсальная)\n\/\/ =====================\nasync function renderItem(stack, data, settings) {\n  const itemStack = stack.addStack();\n  itemStack.layoutHorizontally();\n  itemStack.spacing = 3;\n\n  \/\/ Иконка\/плейсхолдер\n  if (data.type === 'portfolio-header') {\n    const box = itemStack.addStack();\n    box.size = new Size(CONFIG.icons.coin, CONFIG.icons.coin);\n    box.cornerRadius = 2;\n    box.centerAlignContent();\n    const t = box.addText(\"💼\");\n    t.font = Font.systemFont(14);\n    t.centerAlignText();\n  } else if (data.type === 'empty-portfolio') {\n    const box = itemStack.addStack();\n    box.size = new Size(CONFIG.icons.coin, CONFIG.icons.coin);\n    box.cornerRadius = 2;\n    box.centerAlignContent();\n    const t = box.addText(\"📊\");\n    t.font = Font.systemFont(14);\n    t.centerAlignText();\n  } else {\n    try {\n      const coinIcon = await getIcon(data.coin);\n      const img = itemStack.addImage(coinIcon);\n      img.imageSize = new Size(CONFIG.icons.coin, CONFIG.icons.coin);\n      img.cornerRadius = 2;\n    } catch {\n      const fb = itemStack.addText(\"💰\");\n      fb.font = Font.systemFont(CONFIG.icons.coin - 2);\n    }\n  }\n\n  \/\/ Текстовой блок\n  const textStack = itemStack.addStack();\n  textStack.layoutVertically();\n  textStack.spacing = 0;\n\n  \/\/ Верхняя строка (тикер\/заголовок)\n  const titleText = textStack.addText(data.title);\n  titleText.font = Font.systemFont(CONFIG.fonts.main.symbol);\n  titleText.textColor = CONFIG.colors.text;\n\n  \/\/ Нижняя строка (значение + изменение)\n  const bottom = textStack.addStack();\n  bottom.layoutHorizontally();\n  bottom.spacing = 2;\n\n  const valueText = bottom.addText(data.value);\n  valueText.font = Font.systemFont(CONFIG.fonts.main.price);\n  valueText.textColor = data.valueColor || CONFIG.colors.subtext;\n\n  if (data.change && settings.showChange) {\n    const changeText = bottom.addText(data.change);\n    changeText.font = Font.systemFont(CONFIG.fonts.main.change);\n    changeText.textColor = data.changeColor || CONFIG.colors.subtext;\n  }\n}\n\n\/\/ =====================\n\/\/ Виджет\n\/\/ =====================\nasync function createWidget() {\n  const settings = loadSettings();\n  const selectedCoins = settings.selectedCoins || coins.slice(0, 3);\n  const extraCoins    = settings.extraCoins    || coins.slice(3, 6);\n\n  const widget = new ListWidget();\n  widget.setPadding(0, 2, 0, 2);\n  widget.url = URLScheme.forRunningScript();\n\n  try {\n    \/\/ Сбор всех нужных монет (без дублей)\n    const portfolio = Portfolio.load();\n    const portfolioCoins = Object.keys(portfolio).map(id => COINS_BY_ID.get(id) || coins.find(c => c.id === id)).filter(Boolean);\n    const allCoins = [...selectedCoins, ...extraCoins, ...portfolioCoins];\n    const uniqueCoins = allCoins.filter((c, i, arr) => arr.findIndex(x => x.id === c.id) === i);\n\n    \/\/ Цены и уведомления\n    const prices = await fetchPrices(uniqueCoins.length ? uniqueCoins : coins);\n    await NotificationManager.checkAndNotify(prices, settings);\n\n    \/\/ Основной ряд (левая + правая колонка)\n    const mainStack = widget.addStack();\n    mainStack.layoutHorizontally();\n\n    \/\/ Левая колонка — основные монеты\n    const leftStack = mainStack.addStack();\n    leftStack.layoutVertically();\n    leftStack.spacing = 1;\n\n    for (const coin of selectedCoins) {\n      const info = prices[coin.id];\n      if (!info) continue;\n      const price = info.usd ?? 0;\n      const change = info.usd_24h_change ?? 0;\n      const isPositive = change >= 0;\n      await renderItem(leftStack, {\n        type: 'coin',\n        coin,\n        title: coin.symbol,\n        value: formatPrice(price),\n        change: `${isPositive ? \"▲\" : \"▼\"}${Math.abs(change).toFixed(0)}%`,\n        changeColor: isPositive ? CONFIG.colors.up : CONFIG.colors.down\n      }, settings);\n    }\n\n    \/\/ Разделение колонок\n    mainStack.addSpacer();\n\n    \/\/ Правая колонка — доп. монеты или портфель\n    const rightStack = mainStack.addStack();\n    rightStack.layoutVertically();\n    rightStack.spacing = 1;\n\n    if (settings.rightMode === 'portfolio') {\n      \/\/ Портфель\n      const { totalValue, breakdown } = Portfolio.getValue(prices);\n\n      if (breakdown.length > 0) {\n        \/\/ Заголовок портфеля\n        await renderItem(rightStack, {\n          type: 'portfolio-header',\n          title: 'Портфель',\n          value: formatCurrency(totalValue),\n          valueColor: CONFIG.colors.portfolio\n        }, settings);\n\n        \/\/ Топ-позиции\n        const maxPositions = (selectedCoins.length >= 3) ? 2 : 3;\n        const topPositions = breakdown.sort((a, b) => b.value - a.value).slice(0, maxPositions);\n\n        for (const position of topPositions) {\n          const isPositive = position.change >= 0;\n          await renderItem(rightStack, {\n            type: 'portfolio-coin',\n            coin: position.coin,\n            title: position.symbol,\n            value: formatCurrency(position.value),\n            valueColor: CONFIG.colors.portfolio,\n            change: settings.showChange\n              ? `${isPositive ? \"▲\" : \"▼\"}${Math.abs(position.change).toFixed(0)}%`\n              : `${position.percentage.toFixed(0)}%`,\n            changeColor: settings.showChange\n              ? (isPositive ? CONFIG.colors.up : CONFIG.colors.down)\n              : CONFIG.colors.subtext\n          }, settings);\n        }\n      } else {\n        \/\/ Пустой портфель\n        await renderItem(rightStack, {\n          type: 'empty-portfolio',\n          title: 'Портфель',\n          value: 'Пусто',\n          valueColor: CONFIG.colors.subtext\n        }, settings);\n      }\n    } else {\n      \/\/ Доп. монеты\n      for (const coin of extraCoins) {\n        const info = prices[coin.id];\n        if (!info) continue;\n        const price = info.usd ?? 0;\n        const change = info.usd_24h_change ?? 0;\n        const isPositive = change >= 0;\n        await renderItem(rightStack, {\n          type: 'coin',\n          coin,\n          title: coin.symbol,\n          value: formatPrice(price),\n          change: `${isPositive ? \"▲\" : \"▼\"}${Math.abs(change).toFixed(0)}%`,\n          changeColor: isPositive ? CONFIG.colors.up : CONFIG.colors.down\n        }, settings);\n      }\n    }\n\n  } catch (error) {\n    \/\/ Аварийный экран\n    const errorStack = widget.addStack();\n    errorStack.layoutVertically();\n    errorStack.centerAlignContent();\n\n    const errorIcon = errorStack.addText(\"⚠️\");\n    errorIcon.font = Font.systemFont(CONFIG.icons.coin);\n\n    const errorText = errorStack.addText(\"Ошибка загрузки\");\n    errorText.textColor = CONFIG.colors.subtext;\n    errorText.font = Font.systemFont(CONFIG.fonts.main.symbol);\n    errorText.centerAlignText();\n\n    console.log(`❌ Ошибка виджета: ${error.message}`);\n  }\n\n  return widget;\n}\n\n\/\/ =====================\n\/\/ Портфолио — UI\n\/\/ =====================\nasync function addPortfolioPosition(coin) {\n  const a = new Alert();\n  a.title = `Добавить ${coin.symbol}`;\n  a.message = \"Введите количество монет\";\n  a.addTextField(\"0.0\", \"Количество\");\n  a.addAction(\"Добавить\");\n  a.addCancelAction(\"Отмена\");\n\n  if (await a.presentAlert() === 0) {\n    const amount = parseFloat(a.textFieldValue(0));\n    if (amount > 0) {\n      Portfolio.add(coin.id, amount);\n      await showAlert(\"Успех\", `Добавлено ${amount} ${coin.symbol}`);\n    }\n  }\n}\nasync function addPortfolioBySymbol() {\n  const a = new Alert();\n  a.title = \"Найти токен\";\n  a.message = \"Введите символ токена\";\n  a.addTextField(\"\", \"Символ\");\n  a.addAction(\"Найти\");\n  a.addCancelAction(\"Отмена\");\n\n  if (await a.presentAlert() === 0) {\n    const symbol = a.textFieldValue(0).trim().toUpperCase();\n    if (!symbol) return;\n\n    const results = await searchCoin(symbol);\n    if (!results) { await showAlert(\"Ошибка\", `Токен ${symbol} не найден`); return; }\n\n    let selected = results[0];\n    if (results.length > 1) {\n      const menu = new Alert();\n      menu.title = \"Выберите токен\";\n      results.forEach(c => menu.addAction(`${c.symbol} - ${c.name}`));\n      menu.addCancelAction(\"Отмена\");\n      const choice = await menu.presentSheet();\n      if (choice >= 0 && choice < results.length) selected = results[choice]; else return;\n    }\n\n    if (!coins.some(c => c.id === selected.id)) {\n      coins.push(selected);\n      COINS_BY_ID.set(selected.id, selected);\n    }\n    await addPortfolioPosition(selected);\n  }\n}\nasync function showPortfolioMenu() {\n  const portfolio = Portfolio.load();\n  const menu = new Alert();\n  menu.title = \"💼 Портфолио\";\n\n  menu.addAction(\"Добавить позицию\");\n  menu.addAction(\"Показать все позиции\");\n  if (Object.keys(portfolio).length > 0) {\n    menu.addAction(\"Удалить позицию\");\n    menu.addDestructiveAction(\"Очистить портфолио\");\n  }\n  menu.addCancelAction(\"Назад\");\n\n  const choice = await menu.presentSheet();\n\n  switch (choice) {\n    case 0: {\n      const addMenu = new Alert();\n      addMenu.title = \"Добавить в портфолио\";\n      coins.forEach(c => addMenu.addAction(`${c.symbol} - ${c.id.replace(\/-\/g, ' ')}`));\n      addMenu.addAction(\"Найти токен по символу\");\n      addMenu.addCancelAction(\"Отмена\");\n\n      const addChoice = await addMenu.presentSheet();\n      if (addChoice >= 0 && addChoice < coins.length) {\n        await addPortfolioPosition(coins[addChoice]);\n      } else if (addChoice === coins.length) {\n        await addPortfolioBySymbol();\n      }\n      break;\n    }\n    case 1: {\n      const prices = await fetchPrices(coins);\n      const { totalValue, breakdown } = Portfolio.getValue(prices);\n      const a = new Alert();\n      a.title = \"💼 Портфолио\";\n\n      if (!breakdown.length) {\n        a.message = \"Портфолио пусто\";\n      } else {\n        let msg = `💰 Общая стоимость: ${formatCurrency(totalValue)}\\n\\n`;\n        breakdown.sort((a, b) => b.value - a.value).forEach(pos => {\n          const icon = pos.change >= 0 ? \"📈\" : \"📉\";\n          msg += `${pos.symbol}: ${pos.amount.toFixed(4)}\\n`;\n          msg += `└ ${formatCurrency(pos.value)} (${pos.percentage.toFixed(1)}%) ${icon}${Math.abs(pos.change).toFixed(1)}%\\n\\n`;\n        });\n        a.message = msg;\n      }\n      a.addAction(\"OK\");\n      await a.presentAlert();\n      break;\n    }\n    case 2: {\n      const positions = Object.keys(portfolio);\n      if (!positions.length) { await showAlert(\"Портфолио пусто\", \"Нет позиций для удаления\"); return; }\n\n      const rm = new Alert();\n      rm.title = \"Удалить позицию\";\n      positions.forEach(coinId => {\n        const coin = COINS_BY_ID.get(coinId) || coins.find(c => c.id === coinId);\n        const amount = portfolio[coinId];\n        rm.addAction(`${coin?.symbol || coinId} - ${amount.toFixed(4)}`);\n      });\n      rm.addCancelAction(\"Отмена\");\n\n      const idx = await rm.presentSheet();\n      if (idx >= 0 && idx < positions.length) {\n        Portfolio.remove(positions[idx]);\n        await showAlert(\"Успех\", \"Позиция удалена\");\n      }\n      break;\n    }\n    case 3: {\n      const confirm = new Alert();\n      confirm.title = \"⚠️ Подтверждение\";\n      confirm.message = \"Удалить все позиции из портфолио?\";\n      confirm.addDestructiveAction(\"Удалить\");\n      confirm.addCancelAction(\"Отмена\");\n      if (await confirm.presentAlert() === 0) {\n        fm.remove(paths.portfolio);\n        await showAlert(\"Успех\", \"Портфолио очищено\");\n      }\n      break;\n    }\n  }\n}\n\n\/\/ =====================\n\/\/ Настройки — UI\n\/\/ =====================\nasync function showThresholdInput(key, title, settings) {\n  const a = new Alert();\n  a.title = title;\n  a.addTextField(settings.notifications[key].toString(), \"Процент\");\n  a.addAction(\"Сохранить\");\n  a.addCancelAction(\"Отмена\");\n\n  if (await a.presentAlert() === 0) {\n    const value = parseFloat(a.textFieldValue(0));\n    if (value > 0 && value <= 100) {\n      settings.notifications[key] = value;\n      saveSettings(settings);\n    }\n  }\n}\nasync function showCoinSelection(key, title) {\n  const settings = loadSettings();\n  const menu = new Alert();\n  menu.title = title;\n\n  coins.forEach(coin => {\n    const isSelected = (settings[key] || []).some(c => c.id === coin.id);\n    menu.addAction(`${isSelected ? \"✓\" : \"○\"} ${coin.symbol}`);\n  });\n  menu.addCancelAction(\"Готово\");\n\n  const choice = await menu.presentSheet();\n  if (choice >= 0 && choice < coins.length) {\n    const selectedCoin = coins[choice];\n    const current = settings[key] || [];\n\n    const i = current.findIndex(c => c.id === selectedCoin.id);\n    if (i >= 0) current.splice(i, 1);\n    else if (current.length < 3) current.push(selectedCoin);\n\n    settings[key] = current;\n    saveSettings(settings);\n    await showCoinSelection(key, title);\n  }\n}\nfunction clearCache() {\n  let count = 0;\n\n  if (fm.fileExists(paths.icons)) {\n    const files = fm.listContents(paths.icons);\n    files.forEach(file => {\n      try { fm.remove(fm.joinPath(paths.icons, file)); count++; } catch {}\n    });\n  }\n  [paths.cache, paths.search].forEach(p => {\n    if (fm.fileExists(p)) {\n      try { fm.remove(p); count++; } catch {}\n    }\n  });\n\n  console.log(`🗑 Очищено элементов кэша: ${count}`);\n  return count;\n}\nasync function showNotificationSettings() {\n  const settings = loadSettings();\n  const menu = new Alert();\n  menu.title = \"🔔 Уведомления\";\n\n  menu.addAction(settings.notifications.enabled ? \"Отключить уведомления\" : \"Включить уведомления\");\n  if (settings.notifications.enabled) {\n    menu.addAction(`Порог цены: ${settings.notifications.priceChange}%`);\n    menu.addAction(`Порог портфолио: ${settings.notifications.portfolioChange}%`);\n  }\n  menu.addCancelAction(\"Назад\");\n\n  const choice = await menu.presentSheet();\n  switch (choice) {\n    case 0:\n      settings.notifications.enabled = !settings.notifications.enabled;\n      saveSettings(settings);\n      break;\n    case 1:\n      await showThresholdInput('priceChange', 'Порог изменения цены (%)', settings);\n      break;\n    case 2:\n      await showThresholdInput('portfolioChange', 'Порог изменения портфолио (%)', settings);\n      break;\n  }\n}\nasync function showSettingsMenu() {\n  const settings = loadSettings();\n  const menu = new Alert();\n  menu.title = \"⚙️ Настройки\";\n\n  menu.addAction(\"Выбрать основные монеты (лево)\");\n  menu.addAction(\"Выбрать доп монеты (право)\");\n  menu.addAction(`Правая колонка: ${settings.rightMode === 'portfolio' ? 'Портфолио' : 'Доп монеты'}`);\n  menu.addAction(\"Добавить токен по символу\");\n  menu.addAction(settings.showChange ? \"Скрыть изменения\" : \"Показать изменения\");\n  menu.addAction(\"🔔 Уведомления\");\n  menu.addAction(\"Сбросить настройки\");\n  menu.addCancelAction(\"Назад\");\n\n  const choice = await menu.presentSheet();\n  switch (choice) {\n    case 0: await showCoinSelection('selectedCoins', 'Выберите основные монеты (макс. 3)'); break;\n    case 1: await showCoinSelection('extraCoins', 'Выберите дополнительные монеты (макс. 3)'); break;\n    case 2:\n      settings.rightMode = settings.rightMode === 'portfolio' ? 'extra' : 'portfolio';\n      saveSettings(settings);\n      break;\n    case 3: await addPortfolioBySymbol(); break;\n    case 4:\n      settings.showChange = !settings.showChange;\n      saveSettings(settings);\n      break;\n    case 5: await showNotificationSettings(); break;\n    case 6:\n      if (fm.fileExists(paths.settings)) {\n        fm.remove(paths.settings);\n        await showAlert(\"Успех\", \"Настройки сброшены\");\n      }\n      break;\n  }\n}\n\n\/\/ =====================\n\/\/ Главный экран — UI\n\/\/ =====================\nasync function showMainMenu() {\n  const settings = loadSettings();\n  const rightModeText = settings.rightMode === 'portfolio' ? 'Портфолио' : 'Доп монеты';\n\n  const menu = new Alert();\n  menu.title = \"⚡ Crypto Widget Pro\";\n  menu.message = `Основные | ${rightModeText} | ${new Date().toLocaleTimeString()}`;\n\n  menu.addAction(\"🔄 Обновить\");\n  menu.addAction(\"📊 Показать виджет\");\n  menu.addAction(\"💼 Портфолио\");\n  menu.addAction(\"⚙️ Настройки\");\n  menu.addDestructiveAction(\"🗑 Очистить кэш\");\n  menu.addCancelAction(\"Закрыть\");\n\n  const choice = await menu.presentSheet();\n\n  switch (choice) {\n    case 0: {\n      clearCache();\n      const widget = await createWidget();\n      await widget.presentSmall();\n      break;\n    }\n    case 1: {\n      const widget = await createWidget();\n      await widget.presentSmall();\n      break;\n    }\n    case 2: await showPortfolioMenu(); break;\n    case 3: await showSettingsMenu(); break;\n    case 4: {\n      const deleted = clearCache();\n      await showAlert(\"Очистка кэша\", deleted > 0 ? `✅ Удалено элементов: ${deleted}` : \"ℹ️ Кэш уже пуст\");\n      break;\n    }\n  }\n}\n\n\/\/ =====================\n\/\/ Запуск\n\/\/ =====================\nasync function main() {\n  if (config.runsInApp) {\n    await showMainMenu();\n  } else {\n    const widget = await createWidget();\n    Script.setWidget(widget);\n  }\n  Script.complete();\n}\nawait main();",
-  "share_sheet_inputs" : [
+// =====================
+// Crypto Widget Pro — единый стиль колонок
+// =====================
 
-  ]
+// === Конфиг
+const CONFIG = {
+  cacheMinutes: 15,
+  timeout: 10,
+  maxRetries: 3,
+
+  icons: { coin: 18, portfolio: 18 },
+
+  fonts: {
+    main: { symbol: 8, price: 8, change: 6 },
+    portfolio: { symbol: 8, value: 8, percent: 6 }
+  },
+
+  colors: {
+    text: new Color("#ffffff"),
+    subtext: new Color("#aaaaaa"),
+    portfolio: new Color("#aaaaaa"),
+    up: new Color("#00ff88"),
+    down: new Color("#ff5555")
+  }
+};
+
+// === Справочник монет (дефолтный набор)
+let coins = [
+  { id: "bitcoin",           symbol: "BTC",  icon: "https://s2.coinmarketcap.com/static/img/coins/64x64/1.png" },
+  { id: "the-open-network",  symbol: "TON",  icon: "https://assets.coingecko.com/coins/images/17980/large/ton_symbol.png" },
+  { id: "near",              symbol: "NEAR", icon: "https://s2.coinmarketcap.com/static/img/coins/64x64/6535.png" },
+  { id: "solana",            symbol: "SOL",  icon: "https://s2.coinmarketcap.com/static/img/coins/64x64/5426.png" },
+  { id: "ethereum",          symbol: "ETH",  icon: "https://s2.coinmarketcap.com/static/img/coins/64x64/1027.png" },
+  { id: "cardano",           symbol: "ADA",  icon: "https://s2.coinmarketcap.com/static/img/coins/64x64/2010.png" }
+];
+
+// Быстрый доступ coinId → объект монеты
+const COINS_BY_ID = new Map(coins.map(c => [c.id, c]));
+
+// === ФС/пути
+const fm = FileManager.local();
+const basePath = fm.documentsDirectory();
+const paths = {
+  icons:     fm.joinPath(basePath, "crypto_icons"),
+  cache:     fm.joinPath(basePath, "crypto_cache.json"),     // кэш цен (с ключом ids)
+  search:    fm.joinPath(basePath, "search_cache.json"),     // кэш поиска
+  settings:  fm.joinPath(basePath, "crypto_settings.json"),
+  portfolio: fm.joinPath(basePath, "crypto_portfolio.json"),
+  alerts:    fm.joinPath(basePath, "crypto_alerts.json")
+};
+if (!fm.fileExists(paths.icons)) fm.createDirectory(paths.icons);
+
+// === Настройки по умолчанию
+const DEFAULT_SETTINGS = {
+  selectedCoins: coins.slice(0, 3),
+  extraCoins: coins.slice(3, 6),
+  rightMode: 'extra', // 'extra' | 'portfolio'
+  showChange: true,
+  notifications: { enabled: true, priceChange: 10, portfolioChange: 5 }
+};
+
+// =====================
+// Утилиты
+// =====================
+
+// Настройки
+function loadSettings() {
+  if (fm.fileExists(paths.settings)) {
+    try {
+      const settings = JSON.parse(fm.readString(paths.settings));
+      return { ...DEFAULT_SETTINGS, ...settings };
+    } catch (e) {
+      console.log(`⚠️ Ошибка загрузки настроек: ${e.message}`);
+    }
+  }
+  return { ...DEFAULT_SETTINGS };
 }
+function saveSettings(settings) {
+  try { fm.writeString(paths.settings, JSON.stringify(settings)); }
+  catch (e) { console.log(`⚠️ Ошибка сохранения настроек: ${e.message}`); }
+}
+
+// Диалог
+async function showAlert(title, message) {
+  const alert = new Alert();
+  alert.title = title;
+  alert.message = message;
+  alert.addAction("OK");
+  await alert.presentAlert();
+}
+
+// Повторы с бэкоффом
+class NetworkError extends Error {
+  constructor(message, retryable = true) { super(message); this.retryable = retryable; }
+}
+async function retryAsync(fn, maxRetries = CONFIG.maxRetries) {
+  for (let i = 0; i < maxRetries; i++) {
+    try { return await fn(); }
+    catch (error) {
+      console.log(`↻ Попытка ${i + 1}/${maxRetries} неудачна: ${error.message}`);
+      if (i === maxRetries - 1 || !error.retryable) throw error;
+      await new Promise(resolve => Timer.schedule(1000 * (i + 1), false, resolve));
+    }
+  }
+}
+
+// Общий кэш (для мелких словарей)
+class Cache {
+  static isExpired(timestamp, minutes) {
+    return (Date.now() - timestamp) / 60000 > minutes;
+  }
+  static read(path) {
+    if (!fm.fileExists(path)) return null;
+    try {
+      const raw = JSON.parse(fm.readString(path));
+      return this.isExpired(raw.timestamp, CONFIG.cacheMinutes) ? null : raw.data;
+    } catch (e) {
+      console.log(`⚠️ Ошибка чтения кэша: ${e.message}`);
+      return null;
+    }
+  }
+  static write(path, data) {
+    try { fm.writeString(path, JSON.stringify({ data, timestamp: Date.now() })); }
+    catch (e) { console.log(`⚠️ Ошибка записи кэша: ${e.message}`); }
+  }
+}
+
+// Локальный кэш цен с проверкой набора ids (чтобы кэш подходил к запросу)
+function readPricesCache(expectedIdsCSV) {
+  if (!fm.fileExists(paths.cache)) return null;
+  try {
+    const raw = JSON.parse(fm.readString(paths.cache));
+    if (Cache.isExpired(raw.timestamp, CONFIG.cacheMinutes)) return null;
+    if (raw.ids !== expectedIdsCSV) return null;
+    return raw.data || null;
+  } catch (e) {
+    console.log(`⚠️ Ошибка чтения кэша цен: ${e.message}`);
+    return null;
+  }
+}
+function writePricesCache(idsCSV, data) {
+  try {
+    fm.writeString(paths.cache, JSON.stringify({ data, timestamp: Date.now(), ids: idsCSV }));
+  } catch (e) {
+    console.log(`⚠️ Ошибка записи кэша цен: ${e.message}`);
+  }
+}
+
+// =====================
+// API
+// =====================
+
+// Иконка
+async function getIcon(coin) {
+  const file = fm.joinPath(paths.icons, `${coin.symbol}.png`);
+  if (fm.fileExists(file)) {
+    try { const img = Image.fromFile(file); if (img) return img; } catch { fm.remove(file); }
+  }
+  return await retryAsync(async () => {
+    const req = new Request(coin.icon);
+    req.timeoutInterval = CONFIG.timeout;
+    const img = await req.loadImage();
+    if (!img) throw new NetworkError("Иконка не загружена");
+    try { fm.writeImage(file, img); } catch (e) { console.log(`⚠️ Не сохранил иконку ${coin.symbol}: ${e.message}`); }
+    return img;
+  });
+}
+
+// Поиск монеты по символу
+async function searchCoin(symbol) {
+  const cached = Cache.read(paths.search);
+  if (cached && cached[symbol]) return cached[symbol];
+
+  try {
+    const url = `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(symbol)}`;
+    const req = new Request(url);
+    req.timeoutInterval = CONFIG.timeout;
+    const data = await req.loadJSON();
+
+    if (!data?.coins?.length) throw new NetworkError("Токен не найден");
+
+    const results = data.coins.slice(0, 5).map(coin => ({
+      id: coin.id,
+      symbol: coin.symbol.toUpperCase(),
+      name: coin.name,
+      icon: coin.large || coin.thumb || coins[0].icon
+    }));
+
+    const newCache = { ...(cached || {}), [symbol]: results };   // ← безопасное слияние
+    Cache.write(paths.search, newCache);
+    return results;
+  } catch (e) {
+    console.log(`⚠️ Ошибка поиска токена ${symbol}: ${e.message}`);
+    return null;
+  }
+}
+
+// Цены для набора монет (с кэшем по ids)
+async function fetchPrices(coinList = coins) {
+  const ids = coinList.map(c => c.id).join(",");
+  const cached = readPricesCache(ids);
+  if (cached) return cached;
+
+  return await retryAsync(async () => {
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
+    const req = new Request(url);
+    req.timeoutInterval = CONFIG.timeout;
+    const data = await req.loadJSON();
+    if (!data || Object.keys(data).length === 0) throw new NetworkError("Пустой ответ от API");
+    writePricesCache(ids, data);
+    return data;
+  });
+}
+
+// =====================
+// Форматирование
+// =====================
+function formatPrice(price) {
+  if (!price || price === 0) return "—";
+  if (price >= 1_000_000) return `${(price / 1_000_000).toFixed(1)}M$`;
+  if (price >= 1_000)     return `${(price / 1_000).toFixed(1)}K$`;
+  if (price >= 1)         return `${price.toFixed(2)}$`;
+  if (price >= 0.01)      return `${price.toFixed(4)}$`;
+  return `${price.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}$`;
+}
+function formatCurrency(value) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M$`;
+  if (value >= 1_000)     return `${(value / 1_000).toFixed(1)}K$`;
+  return `${value.toFixed(2)}$`;
+}
+
+// =====================
+// Портфолио
+// =====================
+class Portfolio {
+  static load() {
+    if (fm.fileExists(paths.portfolio)) {
+      try { return JSON.parse(fm.readString(paths.portfolio)); }
+      catch (e) { console.log(`⚠️ Ошибка загрузки портфолио: ${e.message}`); }
+    }
+    return {};
+  }
+  static save(portfolio) {
+    try { fm.writeString(paths.portfolio, JSON.stringify(portfolio)); }
+    catch (e) { console.log(`⚠️ Ошибка сохранения портфолио: ${e.message}`); }
+  }
+  static add(coinId, amount) {
+    const p = this.load();
+    p[coinId] = (p[coinId] || 0) + parseFloat(amount);
+    this.save(p);
+  }
+  static remove(coinId) {
+    const p = this.load();
+    delete p[coinId];
+    this.save(p);
+  }
+  static getValue(prices) {
+    const portfolio = this.load();
+    let totalValue = 0;
+    const breakdown = [];
+
+    for (const [coinId, amount] of Object.entries(portfolio)) {
+      const info = prices[coinId];
+      if (!info) continue;
+      const price = info.usd || 0;
+      const change = info.usd_24h_change || 0;
+      const value = amount * price;
+      totalValue += value;
+
+      const coin = COINS_BY_ID.get(coinId) || coins.find(c => c.id === coinId);
+      if (coin && value > 0) {
+        breakdown.push({
+          symbol: coin.symbol,
+          amount,
+          value,
+          change,
+          percentage: 0,
+          coin
+        });
+      }
+    }
+
+    breakdown.forEach(item => {
+      item.percentage = totalValue > 0 ? (item.value / totalValue) * 100 : 0;
+    });
+
+    return { totalValue, breakdown };
+  }
+}
+
+// =====================
+// Уведомления
+// =====================
+class NotificationManager {
+  static load() {
+    if (fm.fileExists(paths.alerts)) {
+      try { return JSON.parse(fm.readString(paths.alerts)); } catch {}
+    }
+    return { lastPrices: {}, lastPortfolioValue: 0, lastCheck: 0 };
+  }
+  static save(data) { fm.writeString(paths.alerts, JSON.stringify(data)); }
+
+  static async checkAndNotify(prices, settings) {
+    if (!settings.notifications.enabled) return;
+
+    const state = this.load();
+    const now = Date.now();
+    if (now - state.lastCheck < 3600000) return; // не чаще часа
+
+    const notifications = [];
+    const allCoins = [...(settings.selectedCoins || []), ...(settings.extraCoins || [])];
+
+    // Изменения цен
+    for (const coin of allCoins) {
+      const current = prices[coin.id]?.usd;
+      const prev = state.lastPrices[coin.id];
+      if (current && prev) {
+        const change = ((current - prev) / prev) * 100;
+        if (Math.abs(change) >= settings.notifications.priceChange) {
+          notifications.push({
+            title: `${coin.symbol} ${change > 0 ? '📈' : '📉'}`,
+            body: `Изменение на ${change.toFixed(1)}%: ${formatCurrency(current)}`
+          });
+        }
+      }
+      if (current) state.lastPrices[coin.id] = current;
+    }
+
+    // Изменение стоимости портфеля (только если выбран режим портфеля справа)
+    if (settings.rightMode === 'portfolio') {
+      const { totalValue } = Portfolio.getValue(prices);
+      if (state.lastPortfolioValue > 0 && totalValue > 0) {
+        const change = ((totalValue - state.lastPortfolioValue) / state.lastPortfolioValue) * 100;
+        if (Math.abs(change) >= settings.notifications.portfolioChange) {
+          notifications.push({
+            title: `Портфолио ${change > 0 ? '💰' : '📉'}`,
+            body: `Изменение на ${change.toFixed(1)}%: ${formatCurrency(totalValue)}`
+          });
+        }
+      }
+      state.lastPortfolioValue = totalValue;
+    }
+
+    // Отправка
+    notifications.forEach(n => {
+      const notif = new Notification();
+      notif.title = n.title;
+      notif.body = n.body;
+      notif.schedule();
+    });
+
+    state.lastCheck = now;
+    this.save(state);
+  }
+}
+
+// =====================
+// Рендер строки (универсальная)
+// =====================
+async function renderItem(stack, data, settings) {
+  const itemStack = stack.addStack();
+  itemStack.layoutHorizontally();
+  itemStack.spacing = 3;
+
+  // Иконка/плейсхолдер
+  if (data.type === 'portfolio-header') {
+    const box = itemStack.addStack();
+    box.size = new Size(CONFIG.icons.coin, CONFIG.icons.coin);
+    box.cornerRadius = 2;
+    box.centerAlignContent();
+    const t = box.addText("💼");
+    t.font = Font.systemFont(14);
+    t.centerAlignText();
+  } else if (data.type === 'empty-portfolio') {
+    const box = itemStack.addStack();
+    box.size = new Size(CONFIG.icons.coin, CONFIG.icons.coin);
+    box.cornerRadius = 2;
+    box.centerAlignContent();
+    const t = box.addText("📊");
+    t.font = Font.systemFont(14);
+    t.centerAlignText();
+  } else {
+    try {
+      const coinIcon = await getIcon(data.coin);
+      const img = itemStack.addImage(coinIcon);
+      img.imageSize = new Size(CONFIG.icons.coin, CONFIG.icons.coin);
+      img.cornerRadius = 2;
+    } catch {
+      const fb = itemStack.addText("💰");
+      fb.font = Font.systemFont(CONFIG.icons.coin - 2);
+    }
+  }
+
+  // Текстовой блок
+  const textStack = itemStack.addStack();
+  textStack.layoutVertically();
+  textStack.spacing = 0;
+
+  // Верхняя строка (тикер/заголовок)
+  const titleText = textStack.addText(data.title);
+  titleText.font = Font.systemFont(CONFIG.fonts.main.symbol);
+  titleText.textColor = CONFIG.colors.text;
+
+  // Нижняя строка (значение + изменение)
+  const bottom = textStack.addStack();
+  bottom.layoutHorizontally();
+  bottom.spacing = 2;
+
+  const valueText = bottom.addText(data.value);
+  valueText.font = Font.systemFont(CONFIG.fonts.main.price);
+  valueText.textColor = data.valueColor || CONFIG.colors.subtext;
+
+  if (data.change && settings.showChange) {
+    const changeText = bottom.addText(data.change);
+    changeText.font = Font.systemFont(CONFIG.fonts.main.change);
+    changeText.textColor = data.changeColor || CONFIG.colors.subtext;
+  }
+}
+
+// =====================
+// Виджет
+// =====================
+async function createWidget() {
+  const settings = loadSettings();
+  const selectedCoins = settings.selectedCoins || coins.slice(0, 3);
+  const extraCoins    = settings.extraCoins    || coins.slice(3, 6);
+
+  const widget = new ListWidget();
+  widget.setPadding(0, 2, 0, 2);
+  widget.url = URLScheme.forRunningScript();
+
+  try {
+    // Сбор всех нужных монет (без дублей)
+    const portfolio = Portfolio.load();
+    const portfolioCoins = Object.keys(portfolio).map(id => COINS_BY_ID.get(id) || coins.find(c => c.id === id)).filter(Boolean);
+    const allCoins = [...selectedCoins, ...extraCoins, ...portfolioCoins];
+    const uniqueCoins = allCoins.filter((c, i, arr) => arr.findIndex(x => x.id === c.id) === i);
+
+    // Цены и уведомления
+    const prices = await fetchPrices(uniqueCoins.length ? uniqueCoins : coins);
+    await NotificationManager.checkAndNotify(prices, settings);
+
+    // Основной ряд (левая + правая колонка)
+    const mainStack = widget.addStack();
+    mainStack.layoutHorizontally();
+
+    // Левая колонка — основные монеты
+    const leftStack = mainStack.addStack();
+    leftStack.layoutVertically();
+    leftStack.spacing = 1;
+
+    for (const coin of selectedCoins) {
+      const info = prices[coin.id];
+      if (!info) continue;
+      const price = info.usd ?? 0;
+      const change = info.usd_24h_change ?? 0;
+      const isPositive = change >= 0;
+      await renderItem(leftStack, {
+        type: 'coin',
+        coin,
+        title: coin.symbol,
+        value: formatPrice(price),
+        change: `${isPositive ? "▲" : "▼"}${Math.abs(change).toFixed(0)}%`,
+        changeColor: isPositive ? CONFIG.colors.up : CONFIG.colors.down
+      }, settings);
+    }
+
+    // Разделение колонок
+    mainStack.addSpacer();
+
+    // Правая колонка — доп. монеты или портфель
+    const rightStack = mainStack.addStack();
+    rightStack.layoutVertically();
+    rightStack.spacing = 1;
+
+    if (settings.rightMode === 'portfolio') {
+      // Портфель
+      const { totalValue, breakdown } = Portfolio.getValue(prices);
+
+      if (breakdown.length > 0) {
+        // Заголовок портфеля
+        await renderItem(rightStack, {
+          type: 'portfolio-header',
+          title: 'Портфель',
+          value: formatCurrency(totalValue),
+          valueColor: CONFIG.colors.portfolio
+        }, settings);
+
+        // Топ-позиции
+        const maxPositions = (selectedCoins.length >= 3) ? 2 : 3;
+        const topPositions = breakdown.sort((a, b) => b.value - a.value).slice(0, maxPositions);
+
+        for (const position of topPositions) {
+          const isPositive = position.change >= 0;
+          await renderItem(rightStack, {
+            type: 'portfolio-coin',
+            coin: position.coin,
+            title: position.symbol,
+            value: formatCurrency(position.value),
+            valueColor: CONFIG.colors.portfolio,
+            change: settings.showChange
+              ? `${isPositive ? "▲" : "▼"}${Math.abs(position.change).toFixed(0)}%`
+              : `${position.percentage.toFixed(0)}%`,
+            changeColor: settings.showChange
+              ? (isPositive ? CONFIG.colors.up : CONFIG.colors.down)
+              : CONFIG.colors.subtext
+          }, settings);
+        }
+      } else {
+        // Пустой портфель
+        await renderItem(rightStack, {
+          type: 'empty-portfolio',
+          title: 'Портфель',
+          value: 'Пусто',
+          valueColor: CONFIG.colors.subtext
+        }, settings);
+      }
+    } else {
+      // Доп. монеты
+      for (const coin of extraCoins) {
+        const info = prices[coin.id];
+        if (!info) continue;
+        const price = info.usd ?? 0;
+        const change = info.usd_24h_change ?? 0;
+        const isPositive = change >= 0;
+        await renderItem(rightStack, {
+          type: 'coin',
+          coin,
+          title: coin.symbol,
+          value: formatPrice(price),
+          change: `${isPositive ? "▲" : "▼"}${Math.abs(change).toFixed(0)}%`,
+          changeColor: isPositive ? CONFIG.colors.up : CONFIG.colors.down
+        }, settings);
+      }
+    }
+
+  } catch (error) {
+    // Аварийный экран
+    const errorStack = widget.addStack();
+    errorStack.layoutVertically();
+    errorStack.centerAlignContent();
+
+    const errorIcon = errorStack.addText("⚠️");
+    errorIcon.font = Font.systemFont(CONFIG.icons.coin);
+
+    const errorText = errorStack.addText("Ошибка загрузки");
+    errorText.textColor = CONFIG.colors.subtext;
+    errorText.font = Font.systemFont(CONFIG.fonts.main.symbol);
+    errorText.centerAlignText();
+
+    console.log(`❌ Ошибка виджета: ${error.message}`);
+  }
+
+  return widget;
+}
+
+// =====================
+// Портфолио — UI
+// =====================
+async function addPortfolioPosition(coin) {
+  const a = new Alert();
+  a.title = `Добавить ${coin.symbol}`;
+  a.message = "Введите количество монет";
+  a.addTextField("0.0", "Количество");
+  a.addAction("Добавить");
+  a.addCancelAction("Отмена");
+
+  if (await a.presentAlert() === 0) {
+    const amount = parseFloat(a.textFieldValue(0));
+    if (amount > 0) {
+      Portfolio.add(coin.id, amount);
+      await showAlert("Успех", `Добавлено ${amount} ${coin.symbol}`);
+    }
+  }
+}
+async function addPortfolioBySymbol() {
+  const a = new Alert();
+  a.title = "Найти токен";
+  a.message = "Введите символ токена";
+  a.addTextField("", "Символ");
+  a.addAction("Найти");
+  a.addCancelAction("Отмена");
+
+  if (await a.presentAlert() === 0) {
+    const symbol = a.textFieldValue(0).trim().toUpperCase();
+    if (!symbol) return;
+
+    const results = await searchCoin(symbol);
+    if (!results) { await showAlert("Ошибка", `Токен ${symbol} не найден`); return; }
+
+    let selected = results[0];
+    if (results.length > 1) {
+      const menu = new Alert();
+      menu.title = "Выберите токен";
+      results.forEach(c => menu.addAction(`${c.symbol} - ${c.name}`));
+      menu.addCancelAction("Отмена");
+      const choice = await menu.presentSheet();
+      if (choice >= 0 && choice < results.length) selected = results[choice]; else return;
+    }
+
+    if (!coins.some(c => c.id === selected.id)) {
+      coins.push(selected);
+      COINS_BY_ID.set(selected.id, selected);
+    }
+    await addPortfolioPosition(selected);
+  }
+}
+async function showPortfolioMenu() {
+  const portfolio = Portfolio.load();
+  const menu = new Alert();
+  menu.title = "💼 Портфолио";
+
+  menu.addAction("Добавить позицию");
+  menu.addAction("Показать все позиции");
+  if (Object.keys(portfolio).length > 0) {
+    menu.addAction("Удалить позицию");
+    menu.addDestructiveAction("Очистить портфолио");
+  }
+  menu.addCancelAction("Назад");
+
+  const choice = await menu.presentSheet();
+
+  switch (choice) {
+    case 0: {
+      const addMenu = new Alert();
+      addMenu.title = "Добавить в портфолио";
+      coins.forEach(c => addMenu.addAction(`${c.symbol} - ${c.id.replace(/-/g, ' ')}`));
+      addMenu.addAction("Найти токен по символу");
+      addMenu.addCancelAction("Отмена");
+
+      const addChoice = await addMenu.presentSheet();
+      if (addChoice >= 0 && addChoice < coins.length) {
+        await addPortfolioPosition(coins[addChoice]);
+      } else if (addChoice === coins.length) {
+        await addPortfolioBySymbol();
+      }
+      break;
+    }
+    case 1: {
+      const prices = await fetchPrices(coins);
+      const { totalValue, breakdown } = Portfolio.getValue(prices);
+      const a = new Alert();
+      a.title = "💼 Портфолио";
+
+      if (!breakdown.length) {
+        a.message = "Портфолио пусто";
+      } else {
+        let msg = `💰 Общая стоимость: ${formatCurrency(totalValue)}\n\n`;
+        breakdown.sort((a, b) => b.value - a.value).forEach(pos => {
+          const icon = pos.change >= 0 ? "📈" : "📉";
+          msg += `${pos.symbol}: ${pos.amount.toFixed(4)}\n`;
+          msg += `└ ${formatCurrency(pos.value)} (${pos.percentage.toFixed(1)}%) ${icon}${Math.abs(pos.change).toFixed(1)}%\n\n`;
+        });
+        a.message = msg;
+      }
+      a.addAction("OK");
+      await a.presentAlert();
+      break;
+    }
+    case 2: {
+      const positions = Object.keys(portfolio);
+      if (!positions.length) { await showAlert("Портфолио пусто", "Нет позиций для удаления"); return; }
+
+      const rm = new Alert();
+      rm.title = "Удалить позицию";
+      positions.forEach(coinId => {
+        const coin = COINS_BY_ID.get(coinId) || coins.find(c => c.id === coinId);
+        const amount = portfolio[coinId];
+        rm.addAction(`${coin?.symbol || coinId} - ${amount.toFixed(4)}`);
+      });
+      rm.addCancelAction("Отмена");
+
+      const idx = await rm.presentSheet();
+      if (idx >= 0 && idx < positions.length) {
+        Portfolio.remove(positions[idx]);
+        await showAlert("Успех", "Позиция удалена");
+      }
+      break;
+    }
+    case 3: {
+      const confirm = new Alert();
+      confirm.title = "⚠️ Подтверждение";
+      confirm.message = "Удалить все позиции из портфолио?";
+      confirm.addDestructiveAction("Удалить");
+      confirm.addCancelAction("Отмена");
+      if (await confirm.presentAlert() === 0) {
+        fm.remove(paths.portfolio);
+        await showAlert("Успех", "Портфолио очищено");
+      }
+      break;
+    }
+  }
+}
+
+// =====================
+// Настройки — UI
+// =====================
+async function showThresholdInput(key, title, settings) {
+  const a = new Alert();
+  a.title = title;
+  a.addTextField(settings.notifications[key].toString(), "Процент");
+  a.addAction("Сохранить");
+  a.addCancelAction("Отмена");
+
+  if (await a.presentAlert() === 0) {
+    const value = parseFloat(a.textFieldValue(0));
+    if (value > 0 && value <= 100) {
+      settings.notifications[key] = value;
+      saveSettings(settings);
+    }
+  }
+}
+async function showCoinSelection(key, title) {
+  const settings = loadSettings();
+  const menu = new Alert();
+  menu.title = title;
+
+  coins.forEach(coin => {
+    const isSelected = (settings[key] || []).some(c => c.id === coin.id);
+    menu.addAction(`${isSelected ? "✓" : "○"} ${coin.symbol}`);
+  });
+  menu.addCancelAction("Готово");
+
+  const choice = await menu.presentSheet();
+  if (choice >= 0 && choice < coins.length) {
+    const selectedCoin = coins[choice];
+    const current = settings[key] || [];
+
+    const i = current.findIndex(c => c.id === selectedCoin.id);
+    if (i >= 0) current.splice(i, 1);
+    else if (current.length < 3) current.push(selectedCoin);
+
+    settings[key] = current;
+    saveSettings(settings);
+    await showCoinSelection(key, title);
+  }
+}
+function clearCache() {
+  let count = 0;
+
+  if (fm.fileExists(paths.icons)) {
+    const files = fm.listContents(paths.icons);
+    files.forEach(file => {
+      try { fm.remove(fm.joinPath(paths.icons, file)); count++; } catch {}
+    });
+  }
+  [paths.cache, paths.search].forEach(p => {
+    if (fm.fileExists(p)) {
+      try { fm.remove(p); count++; } catch {}
+    }
+  });
+
+  console.log(`🗑 Очищено элементов кэша: ${count}`);
+  return count;
+}
+async function showNotificationSettings() {
+  const settings = loadSettings();
+  const menu = new Alert();
+  menu.title = "🔔 Уведомления";
+
+  menu.addAction(settings.notifications.enabled ? "Отключить уведомления" : "Включить уведомления");
+  if (settings.notifications.enabled) {
+    menu.addAction(`Порог цены: ${settings.notifications.priceChange}%`);
+    menu.addAction(`Порог портфолио: ${settings.notifications.portfolioChange}%`);
+  }
+  menu.addCancelAction("Назад");
+
+  const choice = await menu.presentSheet();
+  switch (choice) {
+    case 0:
+      settings.notifications.enabled = !settings.notifications.enabled;
+      saveSettings(settings);
+      break;
+    case 1:
+      await showThresholdInput('priceChange', 'Порог изменения цены (%)', settings);
+      break;
+    case 2:
+      await showThresholdInput('portfolioChange', 'Порог изменения портфолио (%)', settings);
+      break;
+  }
+}
+async function showSettingsMenu() {
+  const settings = loadSettings();
+  const menu = new Alert();
+  menu.title = "⚙️ Настройки";
+
+  menu.addAction("Выбрать основные монеты (лево)");
+  menu.addAction("Выбрать доп монеты (право)");
+  menu.addAction(`Правая колонка: ${settings.rightMode === 'portfolio' ? 'Портфолио' : 'Доп монеты'}`);
+  menu.addAction("Добавить токен по символу");
+  menu.addAction(settings.showChange ? "Скрыть изменения" : "Показать изменения");
+  menu.addAction("🔔 Уведомления");
+  menu.addAction("Сбросить настройки");
+  menu.addCancelAction("Назад");
+
+  const choice = await menu.presentSheet();
+  switch (choice) {
+    case 0: await showCoinSelection('selectedCoins', 'Выберите основные монеты (макс. 3)'); break;
+    case 1: await showCoinSelection('extraCoins', 'Выберите дополнительные монеты (макс. 3)'); break;
+    case 2:
+      settings.rightMode = settings.rightMode === 'portfolio' ? 'extra' : 'portfolio';
+      saveSettings(settings);
+      break;
+    case 3: await addPortfolioBySymbol(); break;
+    case 4:
+      settings.showChange = !settings.showChange;
+      saveSettings(settings);
+      break;
+    case 5: await showNotificationSettings(); break;
+    case 6:
+      if (fm.fileExists(paths.settings)) {
+        fm.remove(paths.settings);
+        await showAlert("Успех", "Настройки сброшены");
+      }
+      break;
+  }
+}
+
+// =====================
+// Главный экран — UI
+// =====================
+async function showMainMenu() {
+  const settings = loadSettings();
+  const rightModeText = settings.rightMode === 'portfolio' ? 'Портфолио' : 'Доп монеты';
+
+  const menu = new Alert();
+  menu.title = "⚡ Crypto Widget Pro";
+  menu.message = `Основные | ${rightModeText} | ${new Date().toLocaleTimeString()}`;
+
+  menu.addAction("🔄 Обновить");
+  menu.addAction("📊 Показать виджет");
+  menu.addAction("💼 Портфолио");
+  menu.addAction("⚙️ Настройки");
+  menu.addDestructiveAction("🗑 Очистить кэш");
+  menu.addCancelAction("Закрыть");
+
+  const choice = await menu.presentSheet();
+
+  switch (choice) {
+    case 0: {
+      clearCache();
+      const widget = await createWidget();
+      await widget.presentSmall();
+      break;
+    }
+    case 1: {
+      const widget = await createWidget();
+      await widget.presentSmall();
+      break;
+    }
+    case 2: await showPortfolioMenu(); break;
+    case 3: await showSettingsMenu(); break;
+    case 4: {
+      const deleted = clearCache();
+      await showAlert("Очистка кэша", deleted > 0 ? `✅ Удалено элементов: ${deleted}` : "ℹ️ Кэш уже пуст");
+      break;
+    }
+  }
+}
+
+// =====================
+// Запуск
+// =====================
+async function main() {
+  if (config.runsInApp) {
+    await showMainMenu();
+  } else {
+    const widget = await createWidget();
+    Script.setWidget(widget);
+  }
+  Script.complete();
+}
+await main();
